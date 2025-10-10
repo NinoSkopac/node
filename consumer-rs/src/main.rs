@@ -154,8 +154,8 @@ async fn run_cli(address: &str, port: u16, cli_args: CliArgs) -> Result<()> {
         match subcommand {
             CliSubcommand::Identities(IdentitiesCommand::Import(import_args)) => {
                 let ImportIdentityArgs { passphrase, key } = import_args;
-                let resolved_key = resolve_identity_key(&key)
-                    .context("failed to parse identity key argument")?;
+                let resolved_key =
+                    resolve_identity_key(&key).context("failed to parse identity key argument")?;
 
                 let address = client
                     .import_identity(&passphrase, &resolved_key)
@@ -274,71 +274,136 @@ fn rebuild_brace_expanded_key(parts: &[String]) -> Result<String> {
             continue;
         }
 
-        let (key, value) = parse_segment(cleaned)
-            .with_context(|| format!("failed to decode segment '{part}'"))?;
-        merge_entry(&mut root, key, value);
+        let (path, value) =
+            parse_segment(cleaned).with_context(|| format!("failed to decode segment '{part}'"))?;
+        merge_path(&mut root, &path, value);
     }
 
     Ok(Value::Object(root).to_string())
 }
 
-fn parse_segment(segment: &str) -> Result<(String, serde_json::Value)> {
-    use serde_json::Value;
-
-    let segment = segment.trim();
-    let mut stream = serde_json::Deserializer::from_str(segment).into_iter::<Value>();
-    let key_value = stream
-        .next()
-        .ok_or_else(|| anyhow!("segment missing key"))?
-        .context("failed to parse segment key")?;
-    let key = match key_value {
-        Value::String(s) => s,
-        _ => return Err(anyhow!("expected string key in segment")),
-    };
-
-    let mut remainder = segment[stream.byte_offset()..].trim_start();
-    if !remainder.starts_with(':') {
-        return Err(anyhow!("expected ':' after key"));
+fn parse_segment(segment: &str) -> Result<(Vec<String>, serde_json::Value)> {
+    let mut trimmed = segment.trim();
+    while trimmed.starts_with('{') {
+        trimmed = trimmed[1..].trim_start();
     }
-    remainder = remainder[1..].trim_start();
-
-    let (value, rest) = parse_value_with_remainder(remainder)?;
-    let rest = rest.trim_start();
-    if !rest.is_empty() && !rest.chars().all(|c| c == '}') {
-        return Err(anyhow!("unexpected trailing characters in segment"));
+    while trimmed.ends_with('}') {
+        trimmed = trimmed[..trimmed.len() - 1].trim_end();
     }
 
-    Ok((key, value))
+    if trimmed.is_empty() {
+        return Err(anyhow!("segment missing key"));
+    }
+
+    let (path_part, value) = split_segment(trimmed)?;
+
+    let mut keys = Vec::new();
+    let mut remainder = path_part.trim();
+    while !remainder.is_empty() {
+        while remainder.starts_with('{') {
+            remainder = remainder[1..].trim_start();
+        }
+        while remainder.ends_with('}') {
+            remainder = remainder[..remainder.len() - 1].trim_end();
+        }
+
+        if remainder.is_empty() {
+            break;
+        }
+
+        let (key, rest_after_key) =
+            parse_json_string(remainder).context("failed to parse segment key component")?;
+        keys.push(key);
+        remainder = rest_after_key.trim_start();
+
+        if remainder.starts_with(':') {
+            remainder = remainder[1..].trim_start();
+            continue;
+        }
+
+        if !remainder.is_empty() {
+            return Err(anyhow!("unexpected characters after key component"));
+        }
+    }
+
+    if keys.is_empty() {
+        return Err(anyhow!("segment missing key path"));
+    }
+
+    Ok((keys, value))
 }
 
-fn parse_value_with_remainder(input: &str) -> Result<(serde_json::Value, &str)> {
+fn split_segment(segment: &str) -> Result<(&str, serde_json::Value)> {
     use serde_json::Value;
 
-    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<Value>();
-    let value = stream
-        .next()
-        .ok_or_else(|| anyhow!("expected JSON value"))?
-        .context("failed to parse JSON value")?;
-    let rest = &input[stream.byte_offset()..];
-    let rest_trimmed = rest.trim_start();
+    let trimmed = segment.trim();
+    for (idx, ch) in trimmed.char_indices() {
+        if matches!(ch, '"' | '{' | '[' | 't' | 'f' | 'n' | '-' | '0'..='9') {
+            if let Ok(value) = serde_json::from_str::<Value>(&trimmed[idx..]) {
+                let path = trimmed[..idx].trim_end();
+                let path = path.trim_end_matches(':').trim_end();
+                return Ok((path, value));
+            }
+        }
+    }
 
-    if rest_trimmed.starts_with(':') {
-        let key = match value {
-            Value::String(s) => s,
-            _ => return Err(anyhow!("expected string key before ':'")),
-        };
+    Err(anyhow!("failed to split segment into path and value"))
+}
 
-        let (nested_value, nested_rest) =
-            parse_value_with_remainder(rest_trimmed[1..].trim_start())?;
-        let mut map = serde_json::Map::new();
-        map.insert(key, nested_value);
-        Ok((Value::Object(map), nested_rest))
-    } else {
-        Ok((value, rest_trimmed))
+fn parse_json_string(input: &str) -> Result<(String, &str)> {
+    if !input.starts_with('"') {
+        return Err(anyhow!("expected string literal"));
+    }
+
+    let mut escaped = false;
+    let mut end_idx = None;
+    for (idx, ch) in input.char_indices().skip(1) {
+        match ch {
+            '"' if !escaped => {
+                end_idx = Some(idx + 1);
+                break;
+            }
+            '\\' if !escaped => escaped = true,
+            _ => escaped = false,
+        }
+    }
+
+    let end = end_idx.ok_or_else(|| anyhow!("unterminated string literal"))?;
+    let value = serde_json::from_str::<String>(&input[..end])
+        .context("failed to deserialize string literal")?;
+    Ok((value, &input[end..]))
+}
+
+fn merge_path(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[String],
+    value: serde_json::Value,
+) {
+    if let Some((first, rest)) = path.split_first() {
+        if rest.is_empty() {
+            merge_entry(target, first.clone(), value);
+            return;
+        }
+
+        let entry = target
+            .entry(first.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        if !entry.is_object() {
+            *entry = serde_json::Value::Object(serde_json::Map::new());
+        }
+
+        if let Some(map) = entry.as_object_mut() {
+            merge_path(map, rest, value);
+        }
     }
 }
 
-fn merge_entry(target: &mut serde_json::Map<String, serde_json::Value>, key: String, value: serde_json::Value) {
+fn merge_entry(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) {
     match target.entry(key) {
         serde_json::map::Entry::Vacant(entry) => {
             entry.insert(value);
@@ -391,29 +456,20 @@ mod tests {
 
     #[test]
     fn rebuilds_identity_from_brace_expanded_arguments() {
-        let parts = vec![
-            String::from("\\\"address\\\":\\\"d363ef3c06eb95460f209e6b8506e103852f75fd\\\""),
-            String::from("\\\"crypto\\\":\\\"cipher\\\":\\\"aes-128-ctr\\\""),
-            String::from(
-                "\\\"crypto\\\":\\\"ciphertext\\\":\\\"480e0f41c5010285ed3eb37bf84cd59ca52059a66dd864fa3787ee919fa7e0c8\\\"",
-            ),
-            String::from(
-                "\\\"crypto\\\":\\\"cipherparams\\\":{\\\"iv\\\":\\\"69cbb6f9f0c26a28077b179e874421e5\\\"}",
-            ),
-            String::from("\\\"crypto\\\":\\\"kdf\\\":\\\"scrypt\\\""),
-            String::from("\\\"crypto\\\":\\\"kdfparams\\\":\\\"dklen\\\":32"),
-            String::from("\\\"crypto\\\":\\\"kdfparams\\\":\\\"n\\\":4096"),
-            String::from("\\\"crypto\\\":\\\"kdfparams\\\":\\\"p\\\":6"),
-            String::from("\\\"crypto\\\":\\\"kdfparams\\\":\\\"r\\\":8"),
-            String::from(
-                "\\\"crypto\\\":\\\"kdfparams\\\":\\\"salt\\\":\\\"d9de24291d6622d81132a94b3b73aa2bad287b28e338e38de26dde65d477b3ef\\\"",
-            ),
-            String::from(
-                "\\\"crypto\\\":\\\"mac\\\":\\\"b126a20eedff31785434a5f77b2a1c1886a472617280d2549c2df4f09708cd48\\\"",
-            ),
-            String::from("\\\"id\\\":\\\"c8bb6fde-6310-4227-b8f6-59020dc36769\\\""),
-            String::from("\\\"version\\\":3"),
-        ];
+        let parts = escaped_brace_segments();
+
+        let rebuilt = rebuild_brace_expanded_key(&parts).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rebuilt).unwrap();
+
+        assert_eq!(value["address"], "d363ef3c06eb95460f209e6b8506e103852f75fd");
+        assert_eq!(value["crypto"]["cipher"], "aes-128-ctr");
+        assert_eq!(value["crypto"]["kdfparams"]["n"], 4096);
+        assert_eq!(value["id"], "c8bb6fde-6310-4227-b8f6-59020dc36769");
+    }
+
+    #[test]
+    fn rebuilds_identity_from_realistic_cli_arguments() {
+        let parts = plain_brace_segments();
 
         let rebuilt = rebuild_brace_expanded_key(&parts).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rebuilt).unwrap();
@@ -429,6 +485,39 @@ mod tests {
         let key = String::from("{\"address\":\"0xabc\"}");
         let resolved = resolve_identity_key(&[key.clone()]).unwrap();
         assert_eq!(resolved, key);
+    }
+
+    fn escaped_brace_segments() -> Vec<String> {
+        plain_brace_segments()
+            .into_iter()
+            .map(|segment| segment.replace('"', "\\\""))
+            .collect()
+    }
+
+    fn plain_brace_segments() -> Vec<String> {
+        vec![
+            String::from("\"address\":\"d363ef3c06eb95460f209e6b8506e103852f75fd\""),
+            String::from("\"crypto\":\"cipher\":\"aes-128-ctr\""),
+            String::from(
+                "\"crypto\":\"ciphertext\":\"480e0f41c5010285ed3eb37bf84cd59ca52059a66dd864fa3787ee919fa7e0c8\"",
+            ),
+            String::from(
+                "\"crypto\":\"cipherparams\":{\"iv\":\"69cbb6f9f0c26a28077b179e874421e5\"}",
+            ),
+            String::from("\"crypto\":\"kdf\":\"scrypt\""),
+            String::from("\"crypto\":\"kdfparams\":\"dklen\":32"),
+            String::from("\"crypto\":\"kdfparams\":\"n\":4096"),
+            String::from("\"crypto\":\"kdfparams\":\"p\":6"),
+            String::from("\"crypto\":\"kdfparams\":\"r\":8"),
+            String::from(
+                "\"crypto\":\"kdfparams\":\"salt\":\"d9de24291d6622d81132a94b3b73aa2bad287b28e338e38de26dde65d477b3ef\"",
+            ),
+            String::from(
+                "\"crypto\":\"mac\":\"b126a20eedff31785434a5f77b2a1c1886a472617280d2549c2df4f09708cd48\"",
+            ),
+            String::from("\"id\":\"c8bb6fde-6310-4227-b8f6-59020dc36769\""),
+            String::from("\"version\":3"),
+        ]
     }
 
     fn view_with_terms(agreed: bool, version: &str) -> RemoteConfigView {
