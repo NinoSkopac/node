@@ -75,7 +75,7 @@ enum IdentitiesCommand {
 #[derive(Parser, Debug)]
 struct ImportIdentityArgs {
     passphrase: String,
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    #[arg(required = true, trailing_var_arg = true)]
     key: Vec<String>,
 }
 
@@ -478,6 +478,38 @@ mod tests {
         assert_eq!(value["crypto"]["cipher"], "aes-128-ctr");
         assert_eq!(value["crypto"]["kdfparams"]["n"], 4096);
         assert_eq!(value["id"], "c8bb6fde-6310-4227-b8f6-59020dc36769");
+    }
+
+    #[test]
+    fn cli_accepts_multiple_identity_key_segments() {
+        let args = MystCli::try_parse_from([
+            "myst",
+            "cli",
+            "identities",
+            "import",
+            "secret",
+            r#""address":"0xabc""#,
+            r#""crypto":"cipher":"aes-128-ctr""#,
+            r#""version":3"#,
+        ])
+        .unwrap();
+
+        let MystCli {
+            command: MystCommand::Cli(CliArgs { subcommand, .. }),
+            ..
+        } = args
+        else {
+            panic!("expected cli command");
+        };
+
+        let CliSubcommand::Identities(IdentitiesCommand::Import(ImportIdentityArgs {
+            passphrase,
+            key,
+        })) = subcommand.expect("missing identities subcommand");
+
+        assert_eq!(passphrase, "secret");
+        assert_eq!(key.len(), 3);
+        assert_eq!(key[0], r#""address":"0xabc""#);
     }
 
     #[test]
