@@ -3,6 +3,7 @@ mod config_view;
 mod server;
 mod state;
 
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
@@ -75,8 +76,8 @@ enum IdentitiesCommand {
 #[derive(Parser, Debug)]
 struct ImportIdentityArgs {
     passphrase: String,
-    #[arg(required = true, trailing_var_arg = true)]
-    key: Vec<String>,
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    key: Vec<OsString>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -154,6 +155,14 @@ async fn run_cli(address: &str, port: u16, cli_args: CliArgs) -> Result<()> {
         match subcommand {
             CliSubcommand::Identities(IdentitiesCommand::Import(import_args)) => {
                 let ImportIdentityArgs { passphrase, key } = import_args;
+                let key = key
+                    .into_iter()
+                    .map(|segment| {
+                        segment.into_string().map_err(|value| {
+                            anyhow!("identity key segment must be valid UTF-8, but found {value:?}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let resolved_key =
                     resolve_identity_key(&key).context("failed to parse identity key argument")?;
 
@@ -506,6 +515,11 @@ mod tests {
             passphrase,
             key,
         })) = subcommand.expect("missing identities subcommand");
+
+        let key = key
+            .into_iter()
+            .map(|value| value.into_string().expect("utf-8 key"))
+            .collect::<Vec<_>>();
 
         assert_eq!(passphrase, "secret");
         assert_eq!(key.len(), 3);
