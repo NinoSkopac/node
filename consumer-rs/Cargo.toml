@@ -1,0 +1,21 @@
+[package]
+name = "myst-consumer-rs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Minimal self-sufficient consumer for establishing Myst connections via Rust"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5.0"
+ethers-core = "2.0"
+ethers-signers = "2.0"
+hex = "0.4"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "signal", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
