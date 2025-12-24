@@ -18,13 +18,13 @@ cargo build --release
 Import a keystore (password can also be provided via `MYST_PASSWORD`):
 
 ```bash
-./target/release/myst-consumer-rs identities import default "$(cat my_keystore.json)" --password "mysecret"
+./target/release/myst-consumer identities import default "$(cat my_keystore.json)" --password "mysecret"
 ```
 
 Bring a proxy up on port 10000, resolving contact from the provider identifier when it already contains `host:port` (otherwise pass `--contact`):
 
 ```bash
-./target/release/myst-consumer-rs connection up 0xprovider --proxy 10000 --contact "provider.host:4050" --password "mysecret" --hermes http://hermes:8889/api/v1
+./target/release/myst-consumer connection up 0xprovider --proxy 10000 --contact "provider.host:4050" --password "mysecret" --hermes http://hermes:8889/api/v1
 ```
 
 The proxy stays alive until `CTRL+C` is received.
