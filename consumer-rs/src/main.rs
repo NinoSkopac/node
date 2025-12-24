@@ -7,7 +7,9 @@ use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::{Client as HttpClient, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +102,14 @@ struct UpArgs {
     /// DNS selection (auto/provider/system/custom)
     #[arg(long, default_value = "auto")]
     dns: String,
+
+    /// Seconds to wait for a connection to reach Connected state
+    #[arg(long, default_value_t = 60)]
+    wait_timeout_secs: u64,
+
+    /// How often to poll connection status while waiting
+    #[arg(long, default_value_t = 2)]
+    status_poll_interval_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -189,7 +199,7 @@ fn connection_up(client: &TequilapiClient, args: UpArgs) -> Result<()> {
 
     let request = ConnectionCreateRequest {
         consumer_id: identity.address,
-        provider_id: None,
+        provider_id: providers.first().cloned(),
         filter: ConnectionCreateFilter {
             providers: if providers.is_empty() {
                 None
@@ -213,6 +223,14 @@ fn connection_up(client: &TequilapiClient, args: UpArgs) -> Result<()> {
     client
         .create_connection(&request)
         .context("failed to create connection")?;
+
+    client
+        .wait_for_connected(
+            args.proxy,
+            Duration::from_secs(args.wait_timeout_secs),
+            Duration::from_secs(args.status_poll_interval_secs),
+        )
+        .context("connection did not reach Connected state")?;
 
     println!("Connected");
     Ok(())
@@ -270,6 +288,7 @@ impl TequilapiClient {
     fn new(host: &str, port: u16) -> Result<Self> {
         let base_url = format!("http://{host}:{port}");
         let http = HttpClient::builder()
+            .no_proxy()
             .user_agent("myst-consumer-rs/0.1")
             .build()
             .context("failed to construct HTTP client")?;
@@ -386,6 +405,35 @@ impl TequilapiClient {
         let resp = ensure_success(resp)?;
         Ok(resp.json().context("failed to parse connection response")?)
     }
+
+    fn wait_for_connected(
+        &self,
+        proxy_port: u16,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            let status = self.connection_status(proxy_port)?;
+            if status
+                .status
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("connected"))
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                bail!(
+                    "connection did not reach Connected state within {:?} (last status: {:?})",
+                    timeout,
+                    status.status
+                );
+            }
+            thread::sleep(poll_interval);
+        }
+    }
 }
 
 fn ensure_success(resp: Response) -> Result<Response> {
@@ -440,11 +488,11 @@ struct TermsResponse {
 
 #[derive(Serialize)]
 struct TermsRequest {
-    #[serde(rename = "agreed_provider")]
+    #[serde(rename = "agreed_provider", skip_serializing_if = "Option::is_none")]
     agreed_provider: Option<bool>,
     #[serde(rename = "agreed_consumer")]
     agreed_consumer: bool,
-    #[serde(rename = "agreed_version")]
+    #[serde(rename = "agreed_version", skip_serializing_if = "Option::is_none")]
     agreed_version: Option<String>,
 }
 
@@ -489,4 +537,150 @@ struct ConnectOptions {
 #[derive(Deserialize)]
 struct ConnectionInfo {
     status: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static INITIAL_STATUS_HIT: AtomicUsize = AtomicUsize::new(0);
+    static CONNECTING_STATUS_HIT: AtomicUsize = AtomicUsize::new(0);
+
+    fn client_for(server: &MockServer) -> TequilapiClient {
+        TequilapiClient::new(&server.host(), server.port()).expect("client")
+    }
+
+    #[test]
+    fn imports_identity_with_base64_payload() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/identities-import")
+                .json_body_partial(r#"{"current_passphrase":"secret","set_default":true}"#);
+            then.status(200).json_body(json!({"address":"0x123"}));
+        });
+
+        let client = client_for(&server);
+        let id = client
+            .import_identity("secret", br#"{"key":"value"}"#, true)
+            .expect("imported");
+
+        mock.assert();
+        assert_eq!(id.address, "0x123");
+    }
+
+    #[test]
+    fn connection_up_flows_through_tequilapi_and_waits_for_connected() {
+        let server = MockServer::start();
+
+        // Terms GET
+        let _terms_get = server.mock(|when, then| {
+            when.method(GET).path("/terms");
+            then.status(200).json_body(json!({
+                "agreed_provider": false,
+                "agreed_consumer": false,
+                "agreed_version": null,
+                "current_version": "1.0.0"
+            }));
+        });
+
+        // Terms POST
+        let _terms_post = server.mock(|when, then| {
+            when.method(POST).path("/terms").json_body(json!({
+                "agreed_consumer": true,
+                "agreed_version": "1.0.0"
+            }));
+            then.status(200);
+        });
+
+        // Connection status before connect
+        INITIAL_STATUS_HIT.store(0, Ordering::SeqCst);
+        let status_before = server.mock(|when, then| {
+            when.method(GET)
+                .path("/connection")
+                .query_param("id", "10000")
+                .matches(|_| INITIAL_STATUS_HIT.fetch_add(1, Ordering::SeqCst) == 0);
+            then.status(200).json_body(json!({"status":"NotConnected"}));
+        });
+
+        // Current identity
+        let _current_identity = server.mock(|when, then| {
+            when.method(PUT).path("/identities/current");
+            then.status(200).json_body(json!({"address":"0xabc"}));
+        });
+
+        // Identity status
+        let _identity_status = server.mock(|when, then| {
+            when.method(GET).path("/identities/0xabc");
+            then.status(200).json_body(json!({
+                "registration_status":"registered"
+            }));
+        });
+
+        // Config
+        let _config = server.mock(|when, then| {
+            when.method(GET).path("/config");
+            then.status(200).json_body(json!({
+                "data":{
+                    "chain-id":1,
+                    "chains":{"1":{"hermes":"0xhermes"}}
+                }
+            }));
+        });
+
+        // Connection create
+        let create = server.mock(|when, then| {
+            when.method(PUT).path("/connection").json_body_partial(
+                json!({
+                    "consumer_id":"0xabc",
+                    "provider_id":"provider1",
+                    "hermes_id":"0xhermes",
+                    "service_type":"wireguard",
+                    "connect_options":{"proxy_port":10000}
+                })
+                .to_string(),
+            );
+            then.status(201).json_body(json!({"status":"Connecting"}));
+        });
+
+        // Connection status after create: Connecting then Connected
+        CONNECTING_STATUS_HIT.store(0, Ordering::SeqCst);
+        let _status_connecting = server.mock(|when, then| {
+            when.method(GET)
+                .path("/connection")
+                .query_param("id", "10000")
+                .matches(|_| CONNECTING_STATUS_HIT.fetch_add(1, Ordering::SeqCst) == 0);
+            then.status(200).json_body(json!({"status":"Connecting"}));
+        });
+        let _status_connected = server.mock(|when, then| {
+            when.method(GET)
+                .path("/connection")
+                .query_param("id", "10000")
+                .matches(|_| CONNECTING_STATUS_HIT.load(Ordering::SeqCst) > 0);
+            then.status(200).json_body(json!({"status":"Connected"}));
+        });
+
+        let client = client_for(&server);
+        connection_up(
+            &client,
+            UpArgs {
+                proxy: 10000,
+                provider: "provider1".into(),
+                service_type: "wireguard".into(),
+                country: None,
+                location_type: None,
+                include_failed: false,
+                sort: "quality".into(),
+                dns: "auto".into(),
+                wait_timeout_secs: 5,
+                status_poll_interval_secs: 1,
+            },
+        )
+        .expect("connected");
+
+        status_before.assert();
+        create.assert();
+    }
 }
