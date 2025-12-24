@@ -58,7 +58,11 @@ struct ImportArgs {
     /// Passphrase of the keystore
     passphrase: String,
     /// Keystore JSON as string or path to a file containing it
-    key: String,
+    key: Option<String>,
+
+    /// Read keystore JSON from stdin (useful to avoid shell brace expansion)
+    #[arg(long, conflicts_with = "key")]
+    stdin: bool,
 
     /// Whether to set the imported identity as default
     #[arg(long, default_value_t = true)]
@@ -129,7 +133,13 @@ fn main() -> Result<()> {
 }
 
 fn import_identity(client: &TequilapiClient, args: ImportArgs) -> Result<()> {
-    let key_data = read_key_blob(&args.key)?;
+    let key_data = if args.stdin {
+        read_key_from_stdin().context("failed to read key from stdin")?
+    } else if let Some(key) = &args.key {
+        read_key_blob(key)?
+    } else {
+        bail!("Provide a key value or use --stdin");
+    };
     let identity = client
         .import_identity(&args.passphrase, &key_data, args.set_default)
         .context("failed to import identity")?;
@@ -245,6 +255,19 @@ fn read_key_blob(input: &str) -> Result<Vec<u8>> {
     }
 
     Ok(input.as_bytes().to_vec())
+}
+
+fn read_key_from_stdin() -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .context("failed to read stdin")?;
+    if buf.is_empty() {
+        bail!("stdin was empty");
+    }
+    Ok(buf)
 }
 
 fn lookup_i64(config: &Value, key: &str) -> Option<i64> {

@@ -17,16 +17,22 @@ cargo build
 
 ```bash
 # Passphrase plus keystore JSON (or path to a file containing the JSON)
-./target/debug/myst \
+./target/debug/myst-consumer \
   --tequilapi-address 127.0.0.1 \
   --tequilapi-port 4050 \
   cli identities import "<passphrase>" "<keystore-json-or-path>"
+
+# Avoid shell brace expansion by piping JSON:
+cat key.json | ./target/debug/myst-consumer \
+  --tequilapi-address 127.0.0.1 \
+  --tequilapi-port 4050 \
+  cli identities import "<passphrase>" --stdin
 ```
 
 ### Bring a connection up
 
 ```bash
-./target/debug/myst \
+./target/debug/myst-consumer \
   --tequilapi-address 127.0.0.1 \
   --tequilapi-port 4050 \
   connection up \
