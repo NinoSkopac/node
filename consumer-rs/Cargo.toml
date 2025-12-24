@@ -1,0 +1,21 @@
+[package]
+name = "myst"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.21"
+clap = { version = "4.5", features = ["derive"] }
+humantime = "2.1"
+parking_lot = "0.12"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+httpmock = "0.7"
